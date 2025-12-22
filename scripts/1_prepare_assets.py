@@ -4,9 +4,12 @@ import json
 import shutil
 import sys
 
-# Add parent dir to path so we can import project_config
+# Add parent dir to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from project_config import *
+
+# CRITICAL: Your workflow (RIFE x2 -> Saver 32fps) requires 16fps input to sync.
+TARGET_FPS = 16 
 
 def get_video_info(path):
     cmd = [
@@ -29,12 +32,11 @@ def get_video_info(path):
         return None
 
 def calculate_smart_crop(src_w, src_h, target_h):
-    # 1. Target 16:9 Width (Mod-16)
+    # Target 16:9 Width (Mod-16)
     target_w = int(target_h * (16/9))
     target_w = (target_w // 16) * 16
     
-    # 2. Find optimal Crop Width (Padding must be Mod-16 per side)
-    # TotalPadding = TargetW - CropW. TotalPadding must be divisible by 32.
+    # Padding must be Mod-16 per side (Total Pad Mod-32)
     k = 0
     while True:
         proposed_crop_w = target_w - (32 * k)
@@ -55,7 +57,7 @@ def calculate_smart_crop(src_w, src_h, target_h):
     }
 
 def main():
-    print("--- 1. PREPARE ASSETS ---")
+    print(f"--- 1. PREPARE ASSETS (Forcing {TARGET_FPS} FPS) ---")
     
     chunks_dir = os.path.join(PROJECT_WORKSPACE, "01_Chunks")
     audio_dir = os.path.join(PROJECT_WORKSPACE, "02_Audio")
@@ -71,38 +73,47 @@ def main():
     print(f"   Original: {info['width']}x{info['height']}")
     print(f"   Target:   {specs['final_w']}x{specs['final_h']} (Pad: {specs['pad_width']}px)")
     
-    # Save Specs
     with open(os.path.join(PROJECT_WORKSPACE, "specs.json"), 'w') as f:
         json.dump(specs, f, indent=4)
 
     # Extract Audio
     subprocess.run([FFMPEG_BIN, "-y", "-i", INPUT_VIDEO, "-vn", "-c:a", "copy", os.path.join(audio_dir, "master_audio.m4a")], check=True)
 
-    # Split & Crop
+    # Split & Crop & Retime
     crop_filter = f"crop={specs['crop_w']}:{specs['crop_h']}:{specs['crop_x']}:{specs['crop_y']}"
     if info['height'] != specs['final_h']: crop_filter += f",scale=-1:{specs['final_h']}"
 
     segment_pattern = os.path.join(chunks_dir, "chunk_%03d.mp4")
-    
-    # Using Loop for precise overlap control
     current_time = 0
     chunk_idx = 0
     
     print("   Splitting Video...")
     while current_time < info['duration']:
         out_name = os.path.join(chunks_dir, f"chunk_{chunk_idx:03d}.mp4")
+        
         cmd = [
-            FFMPEG_BIN, "-y", "-ss", str(current_time), "-t", str(CHUNK_LENGTH),
-            "-i", INPUT_VIDEO, "-vf", crop_filter,
-            "-c:v", "libx264", "-crf", "18", "-preset", "slow", "-an", out_name
+            FFMPEG_BIN, "-y", 
+            "-ss", str(current_time), 
+            "-t", str(CHUNK_LENGTH),
+            "-i", INPUT_VIDEO, 
+            "-vf", crop_filter,
+            "-r", str(TARGET_FPS), # <--- THE CRITICAL FIX
+            "-c:v", "libx264", "-crf", "18", "-preset", "slow", "-an", 
+            out_name
         ]
+        
         subprocess.run(cmd, stderr=subprocess.DEVNULL)
+        
+        if os.path.exists(out_name) and os.path.getsize(out_name) > 0:
+            print(f"\r   Processed Chunk {chunk_idx} @ {current_time:.2f}s...", end="")
+            chunk_idx += 1
+        else:
+            print(f"\n   Warning: Chunk {chunk_idx} failed or end of file reached.")
+        
         current_time += (CHUNK_LENGTH - OVERLAP)
-        chunk_idx += 1
-        print(f"\r   Processed Chunk {chunk_idx}...", end="")
         if current_time >= info['duration']: break
+        
     print("\n   Done.")
 
 if __name__ == "__main__":
     main()
-
