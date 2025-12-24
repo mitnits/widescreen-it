@@ -1,7 +1,6 @@
 import os
 import subprocess
 import glob
-import statistics
 import sys
 import json
 
@@ -9,9 +8,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from project_config import *
 
 COMFY_OUTPUT_DIR = os.path.join(COMFYUI_ROOT_DIR, "output")
-ORIG_CHUNK_DIR = os.path.join(PROJECT_WORKSPACE, "01_Chunks")
+LOCK_OVERLAP = OVERLAP 
+
 AUDIO_FILE = os.path.join(PROJECT_WORKSPACE, "02_Audio", "master_audio.m4a")
-OUTPUT_FILE = os.path.join(PROJECT_WORKSPACE, "Final_Output.mp4")
+TEMP_VIDEO = os.path.join(PROJECT_WORKSPACE, "temp_stitch_silent.mp4")
+OUTPUT_FILE = os.path.join(PROJECT_WORKSPACE, "Final_Pixel_Perfect.mp4")
 
 def get_duration(file_path):
     cmd = [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file_path]
@@ -21,102 +22,85 @@ def get_duration(file_path):
     except: return 0.0
 
 def main():
-    print("--- 3. STITCH & SYNC (SPEED NORMALIZED) ---")
+    print("--- 3. STITCH (PIXEL-LOCK + WMP FIX) ---")
     
-    t_audio = get_duration(AUDIO_FILE)
+    # 1. GATHER FILES
     ai_chunks = sorted(glob.glob(os.path.join(COMFY_OUTPUT_DIR, "remastered_*.mp4")))
-    orig_chunks = sorted(glob.glob(os.path.join(ORIG_CHUNK_DIR, "chunk_*.mp4")))
-    
-    if len(ai_chunks) != len(orig_chunks):
-        print(f"WARNING: Mismatch! AI has {len(ai_chunks)} chunks, Original has {len(orig_chunks)}.")
-        # Proceeding anyway, but trimming to the shorter list
-        min_len = min(len(ai_chunks), len(orig_chunks))
-        ai_chunks = ai_chunks[:min_len]
-        orig_chunks = orig_chunks[:min_len]
-
-    # 1. Calculate Target "Body" Duration
-    t_tail_true = get_duration(orig_chunks[-1])
-    target_body_duration = t_audio - t_tail_true
-    
-    # 2. Get Average Original Chunk Length (The "Correct" Length)
-    # We trust the INPUT length, not the AI output length.
-    body_orig_durations = [get_duration(c) for c in orig_chunks[:-1]]
-    avg_orig_len = statistics.mean(body_orig_durations)
-    
-    # 3. Solve for Overlap based on ORIGINAL length
-    # (N-1) * (OrigLen - Overlap) = TargetBody
-    n_minus_1 = len(ai_chunks) - 1
-    step_duration = target_body_duration / n_minus_1
-    calc_overlap = avg_orig_len - step_duration
-    
-    print(f"   Audio: {t_audio:.2f}s | Tail: {t_tail_true:.2f}s")
-    print(f"   Avg Original Chunk: {avg_orig_len:.2f}s")
-    print(f"   Required Step: {step_duration:.2f}s")
-    print(f"   Calculated Overlap: {calc_overlap:.4f}s")
-
-    if calc_overlap < 0:
-        print("CRITICAL ERROR: Even using original speeds, the chunks are too short.")
+    if not ai_chunks:
+        print("ERROR: No remastered chunks found.")
         return
+        
+    print(f"   Found {len(ai_chunks)} chunks.")
+    print(f"   Locking Overlap to: {LOCK_OVERLAP}s")
 
-    # 4. Construct Filter Chain with SPEED CORRECTION
-    # We verify the AI chunk duration vs Original Chunk duration
-    # If AI is 6.5s and Original is 9.8s, we apply setpts to stretch AI to 9.8s.
+    # 2. CALCULATE DURATION
+    first_chunk_dur = get_duration(ai_chunks[0])
+    step_duration = first_chunk_dur - LOCK_OVERLAP
     
+    print(f"   Chunk Duration: {first_chunk_dur:.2f}s")
+    print(f"   Step Duration:  {step_duration:.2f}s")
+
+    # 3. BUILD FILTER CHAIN
     inputs = []
     filter_chain = ""
     last_stream = "0:v"
-    
-    # We set the initial offset
     current_offset = step_duration
 
-    # Add inputs
     for f in ai_chunks:
         inputs.extend(["-i", f])
 
-    # We need to normalize every chunk speed first? 
-    # Actually, XFADE is tricky with setpts. 
-    # Strategy: We assume all AI chunks need to be normalized to 'avg_orig_len'.
-    # We calculate the stretch factor.
-    
-    ai_body_dur = statistics.mean([get_duration(c) for c in ai_chunks[:-1]])
-    stretch_factor = avg_orig_len / ai_body_dur
-    print(f"   AI Speed Correction Factor: {stretch_factor:.2f}x (Slowing down video to match audio)")
-
-    # Build the complex filter
-    # Chunk 0 is the base.
-    # [0:v]setpts=PTS*Factor[v0_slow];
-    
-    filter_chain += f"[0:v]setpts=PTS*{stretch_factor}[stream0];"
-    last_stream = "stream0"
-
     for i in range(1, len(ai_chunks)):
-        next_input = f"{i}:v"
-        slowed_label = f"stream{i}"
-        
-        # 1. Slow down the input
-        filter_chain += f"[{next_input}]setpts=PTS*{stretch_factor}[{slowed_label}];"
-        
-        # 2. XFade the previous stream with this new slowed stream
-        out_label = f"v_out_{i}" if i < len(ai_chunks) - 1 else "vout"
-        
-        filter_chain += f"[{last_stream}][{slowed_label}]xfade=transition=fade:duration={calc_overlap:.4f}:offset={current_offset:.4f}[{out_label}];"
-        
+        next_stream = f"{i}:v"
+        out_label = f"v{i}" if i < len(ai_chunks) - 1 else "vout"
+        filter_chain += f"[{last_stream}][{next_stream}]xfade=transition=fade:duration={LOCK_OVERLAP}:offset={current_offset}[{out_label}];"
         last_stream = out_label
         current_offset += step_duration
 
-    # 5. Final Command
-    cmd = [
-        FFMPEG_BIN] + inputs + ["-i", AUDIO_FILE, 
-        "-filter_complex", filter_chain.rstrip(";"), 
-        "-map", "[vout]", "-map", f"{len(ai_chunks)}:a",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "16", "-preset", "slow",
-        "-t", str(t_audio), "-y", OUTPUT_FILE
+    # 4. FIRST PASS: STITCH TO TEMP
+    print("\n   [Pass 1] Stitching...")
+    cmd_pass1 = [
+        FFMPEG_BIN, "-y"
+    ] + inputs + [
+        "-filter_complex", filter_chain.rstrip(";"),
+        "-map", "[vout]",
+        
+        # FIX 1: Force standard pixel format
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", 
+        "-preset", "medium", "-crf", "18",
+        TEMP_VIDEO
     ]
+    subprocess.run(cmd_pass1)
+
+    # 5. SECOND PASS: AUDIO SYNC
+    video_dur = get_duration(TEMP_VIDEO)
+    audio_dur = get_duration(AUDIO_FILE)
     
-    print("   Rendering...")
-    subprocess.run(cmd)
-    print(f"   Done: {OUTPUT_FILE}")
+    print(f"\n   [Sync Check]")
+    print(f"   Stitched Video: {video_dur:.2f}s")
+    print(f"   Master Audio:   {audio_dur:.2f}s")
+    
+    pts_factor = audio_dur / video_dur
+    print(f"   Correction: {pts_factor:.4f}x")
+
+    print("\n   [Pass 2] Syncing...")
+    cmd_pass2 = [
+        FFMPEG_BIN, "-y",
+        "-i", TEMP_VIDEO,
+        "-i", AUDIO_FILE,
+        "-filter_complex", f"[0:v]setpts=PTS*{pts_factor}[vfinal]",
+        "-map", "[vfinal]",
+        "-map", "1:a",
+        
+        # FIX 2: Force standard pixel format (Final Output)
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", 
+        "-preset", "slow", "-crf", "16",
+        "-shortest",
+        OUTPUT_FILE
+    ]
+    subprocess.run(cmd_pass2)
+    
+    print(f"\nDONE! {OUTPUT_FILE}")
+    if os.path.exists(TEMP_VIDEO): os.remove(TEMP_VIDEO)
 
 if __name__ == "__main__":
     main()
-
