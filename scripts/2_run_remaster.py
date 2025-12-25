@@ -9,7 +9,7 @@ import random
 import shutil
 import sys
 import subprocess
-import argparse  # Added for CLI arguments
+import argparse 
 from PIL import Image
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -87,7 +87,7 @@ def find_latest_ref(filename_prefix):
     if not candidates: return None
     return max(candidates, key=os.path.getmtime)
 
-def run_batch(limit_chunks=None):
+def run_batch(limit_chunks=None, start_chunk=0, forced_seed=None):
     if not os.path.exists(SPECS_FILE): 
         print(f"Error: {SPECS_FILE} not found.")
         return
@@ -103,41 +103,72 @@ def run_batch(limit_chunks=None):
         print(f"Error connecting to ComfyUI: {e}")
         return
 
-    # Load templates
     with open(WORKFLOW_STD_FILE, 'r') as f: workflow_std = json.load(f)
     if START_METHOD == "NO_REF":
         with open(WORKFLOW_NOREF_FILE, 'r') as f: workflow_noref = json.load(f)
 
-    chunks = sorted(glob.glob(os.path.join(PROJECT_WORKSPACE, "01_Chunks", "*.mp4")))
+    all_chunks = sorted(glob.glob(os.path.join(PROJECT_WORKSPACE, "01_Chunks", "*.mp4")))
     
-    # --- APPLY CHUNK LIMIT ---
+    # --- RESUME LOGIC ---
+    if start_chunk > 0:
+        print(f"\n[RESUME MODE] Jumping to Chunk {start_chunk}")
+        prev_idx = start_chunk - 1
+        prev_ref_prefix = f"ref_frame_{prev_idx:03d}"
+        prev_ref_img = find_latest_ref(prev_ref_prefix)
+        
+        if prev_ref_img and os.path.exists(prev_ref_img):
+            shutil.copy(prev_ref_img, os.path.join(COMFY_INPUT_DIR, LOOPBACK_FILENAME))
+            print(f"   [Resume] Loaded continuity reference: {os.path.basename(prev_ref_img)}")
+        else:
+            print(f"   [WARNING] No reference found for Chunk {prev_idx}! Starting blind.")
+
+    chunks_to_process = all_chunks[start_chunk:]
     if limit_chunks and limit_chunks > 0:
-        print(f"\n[DEBUG MODE] Processing first {limit_chunks} chunks only.")
-        chunks = chunks[:limit_chunks]
+        chunks_to_process = chunks_to_process[:limit_chunks]
     
-    for i, chunk_path in enumerate(chunks):
+    for i, chunk_path in enumerate(chunks_to_process, start=start_chunk):
         fname = os.path.basename(chunk_path)
         frames, dur = get_video_details(chunk_path)
         if dur > 0: fps = frames / dur
         else: fps = 16 
         fps = round(fps)
         
+        # --- CLEANUP ---
+        prefix_vid = f"remastered_{i:03d}"
+        prefix_ref = f"ref_frame_{i:03d}"
+        old_files = glob.glob(os.path.join(COMFY_OUTPUT_DIR, f"{prefix_vid}*.mp4")) + \
+                    glob.glob(os.path.join(COMFY_OUTPUT_DIR, f"{prefix_ref}*.png"))
+        if old_files:
+            for f in old_files:
+                try: os.remove(f)
+                except OSError: pass
+
+        # --- SEED GENERATION ---
+        # If user passed --seed, use it. Otherwise, generate random.
+        if forced_seed is not None:
+            current_seed = forced_seed
+            seed_msg = f"Fixed: {current_seed}"
+        else:
+            current_seed = random.randint(1, 10**10)
+            seed_msg = f"Random: {current_seed}"
+
         # --- STRATEGY SELECTION ---
         if i == 0 and START_METHOD == "NO_REF":
-            print(f"\n--- Chunk {i+1} [MODE: NO_REF START]: {fname} ---")
+            print(f"\n--- Chunk {i+1} [MODE: NO_REF] [Seed: {seed_msg}]: {fname} ---")
             workflow = workflow_noref.copy()
         else:
-            print(f"\n--- Chunk {i+1} [MODE: STANDARD LOOP]: {fname} ---")
+            print(f"\n--- Chunk {i+1} [MODE: LOOP] [Seed: {seed_msg}]: {fname} ---")
             workflow = workflow_std.copy()
             workflow[NODE_MAP["image_loader"]]["inputs"]["image"] = LOOPBACK_FILENAME
 
-        # --- COMMON INJECTIONS ---
+        # --- INJECTIONS ---
+        workflow[NODE_MAP["seed_node"]]["inputs"]["seed"] = current_seed
+
         pad = int(specs['pad_width'])
         workflow[NODE_MAP["pad_node"]]["inputs"]["left"] = pad
         workflow[NODE_MAP["pad_node"]]["inputs"]["right"] = pad
-        workflow[NODE_MAP["pad_node"]]["inputs"]["method"] = "edge"
-        workflow[NODE_MAP["pad_node"]]["inputs"]["feathering"] = 10 
-        # Note: You can reduce feathering here if needed (e.g., to 20)
+        workflow[NODE_MAP["pad_node"]]["inputs"]["method"] = "reflect"
+        workflow[NODE_MAP["pad_node"]]["inputs"]["feathering"] = 10
         
         workflow[NODE_MAP["width_node"]]["inputs"]["value"] = int(specs['final_w'])
         workflow[NODE_MAP["height_node"]]["inputs"]["value"] = int(specs['final_h'])
@@ -146,12 +177,10 @@ def run_batch(limit_chunks=None):
         workflow[NODE_MAP["video_saver"]]["inputs"]["frame_rate"] = fps * 2
 
         workflow[NODE_MAP["video_loader"]]["inputs"]["file"] = fname
-        workflow[NODE_MAP["seed_node"]]["inputs"]["seed"] = random.randint(1, 10**10)
         
-        ref_prefix = f"ref_frame_{i:03d}"
-        workflow[NODE_MAP["video_saver"]]["inputs"]["filename_prefix"] = f"remastered_{i:03d}"
+        workflow[NODE_MAP["video_saver"]]["inputs"]["filename_prefix"] = prefix_vid
         if "ref_saver" in NODE_MAP and NODE_MAP["ref_saver"] in workflow:
-            workflow[NODE_MAP["ref_saver"]]["inputs"]["filename_prefix"] = ref_prefix
+            workflow[NODE_MAP["ref_saver"]]["inputs"]["filename_prefix"] = prefix_ref
 
         # --- EXECUTE ---
         prompt_id = queue_prompt(workflow, client_id)['prompt_id']
@@ -164,7 +193,7 @@ def run_batch(limit_chunks=None):
                     break
         
         # --- LOOPBACK CAPTURE ---
-        generated_ref = find_latest_ref(ref_prefix)
+        generated_ref = find_latest_ref(prefix_ref)
         if generated_ref and os.path.exists(generated_ref):
             shutil.copy(generated_ref, os.path.join(COMFY_INPUT_DIR, LOOPBACK_FILENAME))
             print(f"   [Loopback] Updated Reference.")
@@ -173,7 +202,10 @@ def run_batch(limit_chunks=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run ComfyUI Remaster Batch")
-    parser.add_argument("--chunks", type=int, default=None, help="Limit number of chunks to process (Debug mode)")
+    parser.add_argument("--chunks", type=int, default=None, help="Limit number of chunks (Debug)")
+    parser.add_argument("--start_chunk", type=int, default=0, help="Start from specific chunk index")
+    parser.add_argument("--seed", type=int, default=None, help="Force a specific seed for all chunks")
     args = parser.parse_args()
     
-    run_batch(limit_chunks=args.chunks)
+    run_batch(limit_chunks=args.chunks, start_chunk=args.start_chunk, forced_seed=args.seed)
+

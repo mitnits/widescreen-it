@@ -12,7 +12,7 @@ from project_config import *
 # CONFIGURATION
 # =========================================================
 TARGET_FPS = 16 
-SAFETY_SHAVE = 8  
+SAFETY_SHAVE = 16  
 # =========================================================
 
 def get_video_info(path):
