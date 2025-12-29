@@ -2,8 +2,8 @@
   "3": {
     "inputs": {
       "seed": 1065719521188726,
-      "steps": 3,
-      "cfg": 1,
+      "steps": 5,
+      "cfg": 1.5,
       "sampler_name": "uni_pc",
       "scheduler": "simple",
       "denoise": 1,

@@ -81,11 +81,22 @@ def setup_environment(specs):
     else:
         print(f"   [Strategy: NO_REF] Skipping Black Image generation.")
 
-def find_latest_ref(filename_prefix):
+def find_latest_ref_with_retry(filename_prefix, retries=10, delay=0.5):
+    """Retries finding the file to handle filesystem race conditions."""
     search_path = os.path.join(COMFY_OUTPUT_DIR, f"{filename_prefix}*.png")
-    candidates = glob.glob(search_path)
-    if not candidates: return None
-    return max(candidates, key=os.path.getmtime)
+    
+    for i in range(retries):
+        candidates = glob.glob(search_path)
+        if candidates:
+            # File found!
+            return max(candidates, key=os.path.getmtime)
+        time.sleep(delay)
+        
+    return None
+
+def find_latest_ref(filename_prefix):
+    # Backward compatibility wrapper if needed, but we use the retry version now
+    return find_latest_ref_with_retry(filename_prefix, retries=1)
 
 def run_batch(limit_chunks=None, start_chunk=0, forced_seed=None):
     if not os.path.exists(SPECS_FILE): 
@@ -114,7 +125,9 @@ def run_batch(limit_chunks=None, start_chunk=0, forced_seed=None):
         print(f"\n[RESUME MODE] Jumping to Chunk {start_chunk}")
         prev_idx = start_chunk - 1
         prev_ref_prefix = f"ref_frame_{prev_idx:03d}"
-        prev_ref_img = find_latest_ref(prev_ref_prefix)
+        
+        # Use retry here too, just in case the user JUST finished copying it manually
+        prev_ref_img = find_latest_ref_with_retry(prev_ref_prefix, retries=2)
         
         if prev_ref_img and os.path.exists(prev_ref_img):
             shutil.copy(prev_ref_img, os.path.join(COMFY_INPUT_DIR, LOOPBACK_FILENAME))
@@ -133,9 +146,10 @@ def run_batch(limit_chunks=None, start_chunk=0, forced_seed=None):
         else: fps = 16 
         fps = round(fps)
         
-        # --- CLEANUP ---
         prefix_vid = f"remastered_{i:03d}"
         prefix_ref = f"ref_frame_{i:03d}"
+        
+        # --- CLEANUP ---
         old_files = glob.glob(os.path.join(COMFY_OUTPUT_DIR, f"{prefix_vid}*.mp4")) + \
                     glob.glob(os.path.join(COMFY_OUTPUT_DIR, f"{prefix_ref}*.png"))
         if old_files:
@@ -143,8 +157,6 @@ def run_batch(limit_chunks=None, start_chunk=0, forced_seed=None):
                 try: os.remove(f)
                 except OSError: pass
 
-        # --- SEED GENERATION ---
-        # If user passed --seed, use it. Otherwise, generate random.
         if forced_seed is not None:
             current_seed = forced_seed
             seed_msg = f"Fixed: {current_seed}"
@@ -152,7 +164,6 @@ def run_batch(limit_chunks=None, start_chunk=0, forced_seed=None):
             current_seed = random.randint(1, 10**10)
             seed_msg = f"Random: {current_seed}"
 
-        # --- STRATEGY SELECTION ---
         if i == 0 and START_METHOD == "NO_REF":
             print(f"\n--- Chunk {i+1} [MODE: NO_REF] [Seed: {seed_msg}]: {fname} ---")
             workflow = workflow_noref.copy()
@@ -192,11 +203,18 @@ def run_batch(limit_chunks=None, start_chunk=0, forced_seed=None):
                     print("   Generation Complete.")
                     break
         
-        # --- LOOPBACK CAPTURE ---
-        generated_ref = find_latest_ref(prefix_ref)
+        # --- LOOPBACK CAPTURE (With Retry) ---
+        generated_ref = find_latest_ref_with_retry(prefix_ref, retries=10, delay=0.5)
+        
         if generated_ref and os.path.exists(generated_ref):
             shutil.copy(generated_ref, os.path.join(COMFY_INPUT_DIR, LOOPBACK_FILENAME))
             print(f"   [Loopback] Updated Reference.")
+        else:
+            # FATAL ERROR CATCHER
+            print(f"\n[CRITICAL ERROR] Failed to find reference image for Chunk {i}!")
+            print(f"Expected: {prefix_ref}...")
+            print("Stopping batch to prevent corrupted cascade.")
+            sys.exit(1)
         
         time.sleep(0.5)
 
