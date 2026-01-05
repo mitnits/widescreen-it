@@ -74,10 +74,31 @@ def setup_environment(specs):
     chunks = glob.glob(os.path.join(PROJECT_WORKSPACE, "01_Chunks", "*.mp4"))
     for c in chunks: shutil.copy(c, COMFY_INPUT_DIR)
     
+    target_path = os.path.join(COMFY_INPUT_DIR, LOOPBACK_FILENAME)
+
     if START_METHOD == "BLACK_REF":
         img = Image.new('RGB', (specs['final_w'], specs['final_h']), color=(0, 0, 0))
-        img.save(os.path.join(COMFY_INPUT_DIR, LOOPBACK_FILENAME))
+        img.save(target_path)
         print(f"   [Strategy: BLACK_REF] Created Black Zero-Step Image.")
+    elif START_METHOD == "FIRST_FRAME":
+        print(f"   [Strategy: FIRST_FRAME] Extracting and scaling 1st frame...")
+        w, h = specs['final_w'], specs['final_h']
+        cmd = [
+            FFMPEG_BIN, "-y", 
+            "-i", INPUT_VIDEO, 
+            "-vframes", "1",
+            "-vf", f"scale={w}:{h}",
+            target_path
+        ]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            print(f"   [Strategy: FIRST_FRAME] Saved reference to {target_path}")
+        except subprocess.CalledProcessError as e:
+            print(f"   [ERROR] Failed to extract first frame: {e}")
+            # Fallback to black
+            img = Image.new('RGB', (w, h), color=(0, 0, 0))
+            img.save(target_path)
+            print("   [Fallback] Created Black Image.")
     else:
         print(f"   [Strategy: NO_REF] Skipping Black Image generation.")
 

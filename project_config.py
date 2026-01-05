@@ -21,7 +21,8 @@ FFMPEG_BIN = "ffmpeg"
 FFPROBE_BIN = "ffprobe"
 
 # 5. STARTUP STRATEGY
-# "BLACK_REF" = Create a black image and use standard workflow (Best for fade-ins)
-# "NO_REF"    = Use 'workflow_api_no_ref.json' for Chunk 0 (Best for instant starts)
+# "BLACK_REF"   = Create a black image and use standard workflow (Best for fade-ins)
+# "NO_REF"      = Use 'workflow_api_no_ref.json' for Chunk 0 (Best for instant starts)
+# "FIRST_FRAME" = Extract 1st frame from original video, scale to 16:9, use as reference
 START_METHOD = "BLACK_REF"
 
